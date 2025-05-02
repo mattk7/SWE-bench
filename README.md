@@ -70,6 +70,15 @@ python -m swebench.harness.run_evaluation \
     --instance_ids sympy__sympy-20590 \
     --run_id validate-gold
 ```
+If using a MacOS M-series or other ARM-based systems, test your installation by running:
+```bash
+python -m swebench.harness.run_evaluation \
+    --predictions_path gold \
+    --max_workers 1 \
+    --instance_ids sympy__sympy-20590 \
+    --run_id validate-gold
+    --namespace ''
+```
 
 ## 💽 Usage
 Evaluate patch predictions on SWE-bench Lite with the following command:
