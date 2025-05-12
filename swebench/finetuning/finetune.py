@@ -17,7 +17,7 @@ from datasets import load_from_disk
 from peft import (
     LoraConfig,
     get_peft_model,
-    prepare_model_for_kbit_training,
+    prepare_model_for_kbit_training,∏
     TaskType
 )
 
@@ -87,9 +87,6 @@ if False:
     #ds = load_dataset("SWE-bench/SWE-bench")
     ds = load_dataset("princeton-nlp/SWE-bench_oracle")
 
-    # Now tokenize the dataset
-
-    ds.save_to_disk('./training_data')
 
     # Tokenize the dataset
     tokenize_dataset(
@@ -99,6 +96,10 @@ if False:
         num_proc=30,
         push_to_hub_user=None
     )
+
+    # Now tokenize the dataset
+    ds.save_to_disk('./training_data')
+
 
     # https://chatgpt.com/c/681a65f3-8a18-800e-b2b9-1fb183a4dab4
 
