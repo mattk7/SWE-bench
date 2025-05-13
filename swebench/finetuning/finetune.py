@@ -13,12 +13,22 @@ from transformers import (
     TrainerCallback,
     BitsAndBytesConfig
 )
+
+
 from datasets import load_from_disk
 from peft import (
     LoraConfig,
     get_peft_model,
     prepare_model_for_kbit_training,∏
     TaskType
+)
+
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_use_double_quant=False,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16,
 )
 
 # Load the model
@@ -41,11 +51,15 @@ model = AutoModelForCausalLM.from_pretrained(
     model_name,
     torch_dtype=torch.float16,  # Explicitly set to float16
     device_map="auto",
-    quantization_config=BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.float16
-    )
+    quantization_config=bnb_config,
+    trust_remote_code=True,
+    attn_implementation="flash_attention_2",
 )
+
+model.config.use_cache = False # Disable caching to save memory during training, set to True for inference
+#model.config.pretraining_tp = 1
+
+
 print(f"After AutoModelForCausalLM: {torch.cuda.memory_allocated() / (1024 ** 2):.2f} MB")
 print(torch.cuda.memory_summary())
 
@@ -60,19 +74,28 @@ print(torch.cuda.memory_summary())
 
 
 # Configure LoRA
-lora_config = LoraConfig(
-    r=16,                   # Rank
+peft_config = LoraConfig(
+    r=64,                   # Rank
     lora_alpha=16,# 16,         # Alpha parameter
 #    target_modules=["q_proj", "v_proj"],
-    target_modules=["q_proj", "v_proj"],#, "k_proj", "o_proj"],
+#    target_modules=["q_proj", "v_proj"],#, "k_proj", "o_proj"],
 #    target_modules=["q_proj", "v_proj", "k_proj", "o_proj", 
 #                    "gate_proj", "up_proj", "down_proj"],
     lora_dropout=0.05,     # Dropout probability
     bias="none",
-    task_type=TaskType.CAUSAL_LM
+    task_type="CAUSAL_LM",
+    target_modules=[
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    ],
 )
 # Apply LoRA to model
-model = get_peft_model(model, lora_config)
+model = get_peft_model(model, peft_config)
 model.print_trainable_parameters()
 
 print(f"After get_peft_model: {torch.cuda.memory_allocated() / (1024 ** 2):.2f} MB")
