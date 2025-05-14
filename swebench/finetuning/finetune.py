@@ -19,7 +19,7 @@ from datasets import load_from_disk
 from peft import (
     LoraConfig,
     get_peft_model,
-    prepare_model_for_kbit_training,∏
+    prepare_model_for_kbit_training,
     TaskType
 )
 
@@ -39,7 +39,11 @@ model_name = "Qwen/Qwen3-0.6B"
 print(f"Before tokenizer: {torch.cuda.memory_allocated() / (1024 ** 2):.2f} MB")
 print(torch.cuda.memory_summary())
 
-tokenizer = AutoTokenizer.from_pretrained(model_name)
+tokenizer = AutoTokenizer.from_pretrained(
+    model_name,
+    trust_remote_code=True,
+    revision="main"
+)
 tokenizer.pad_token = tokenizer.eos_token if tokenizer.pad_token is None else tokenizer.pad_token
 
 print(f"After tokenizer: {torch.cuda.memory_allocated() / (1024 ** 2):.2f} MB")
@@ -53,7 +57,7 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map="auto",
     quantization_config=bnb_config,
     trust_remote_code=True,
-    attn_implementation="flash_attention_2",
+    revision="main"
 )
 
 model.config.use_cache = False # Disable caching to save memory during training, set to True for inference
