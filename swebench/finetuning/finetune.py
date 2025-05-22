@@ -25,10 +25,14 @@ from peft import (
 
 
 bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_use_double_quant=False,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16,
+    #load_in_4bit=True,
+    #bnb_4bit_use_double_quant=True,
+    #bnb_4bit_quant_type="nf4",
+    #bnb_4bit_compute_dtype=torch.bfloat16,
+    load_in_8bit=True,
+    bnb_8bit_use_double_quant=True,
+    bnb_8bit_quant_type="nf8",
+    bnb_8bit_compute_dtype=torch.float16,    
 )
 
 # Load the model
@@ -39,10 +43,15 @@ model_name = "Qwen/Qwen3-0.6B"
 print(f"Before tokenizer: {torch.cuda.memory_allocated() / (1024 ** 2):.2f} MB")
 print(torch.cuda.memory_summary())
 
+# Fix: Don't set padding='max_length' here, let the data collator handle it
 tokenizer = AutoTokenizer.from_pretrained(
     model_name,
     trust_remote_code=True,
-    revision="main"
+    revision="main",
+    use_fast=True,
+#    truncation=True,
+#    max_length=40000,
+#    padding='max_length', #'max_length',
 )
 tokenizer.pad_token = tokenizer.eos_token if tokenizer.pad_token is None else tokenizer.pad_token
 
@@ -61,7 +70,8 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 
 model.config.use_cache = False # Disable caching to save memory during training, set to True for inference
-#model.config.pretraining_tp = 1
+model.config.pretraining_tp = 1 # is a configuration parameter for the model, where tp stands for tensor parallelism.
+# Setting pretraining_tp = 1 means no tensor parallelism (i.e., the model will not split its weights across multiple devices for parallel computation).
 
 
 print(f"After AutoModelForCausalLM: {torch.cuda.memory_allocated() / (1024 ** 2):.2f} MB")
@@ -79,7 +89,7 @@ print(torch.cuda.memory_summary())
 
 # Configure LoRA
 peft_config = LoraConfig(
-    r=64,                   # Rank
+    r=32,                   # Rank
     lora_alpha=16,# 16,         # Alpha parameter
 #    target_modules=["q_proj", "v_proj"],
 #    target_modules=["q_proj", "v_proj"],#, "k_proj", "o_proj"],
@@ -108,130 +118,184 @@ print(torch.cuda.memory_summary())
 
 from datasets import load_dataset
 from swebench.inference.make_datasets.tokenize_dataset import main as tokenize_dataset
+from trl import SFTConfig, SFTTrainer
+from transformers import TrainingArguments
+
+# Login using e.g. `huggingface-cli login` to access this dataset
+ds = load_dataset("princeton-nlp/SWE-bench_bm25_40K")
+#ds = load_dataset("princeton-nlp/SWE-bench_bm25_13K")
+ds = ds.rename_column("text", "prompt")
+ds = ds.rename_column("patch", "completion")
+ds = ds.remove_columns([col for col in ds['train'].column_names if col not in ["prompt", "completion"]])
+
+
+def tokenize_function(examples):
+    #print(len(examples["prompt"]))
+    # Tokenize prompts and completions separately
+    tokenized_prompts = tokenizer(
+        ['<|im_start|>' + x + '<|im_end|>' for x in examples["prompt"]],
+        truncation=False, #True,
+        #max_length=3072,  # Adjust based on your needs
+        padding=False,
+        return_tensors=None,
+    )
+    
+    tokenized_completions = tokenizer(
+        ['<|im_start|>' + x + '<|im_end|>' for x in examples["completion"]],
+        truncation=False, #True,
+        #max_length=1024,  # Adjust based on your needs
+        padding=False,
+        return_tensors=None,
+    )
+    
+    # Create separate input_ids field for both prompt and completion
+    result = {
+        "input_ids": [],
+        "attention_mask": [],
+        "labels": []
+    }
+    
+    for i in range(len(tokenized_prompts["input_ids"])):
+        # Combine prompt and completion input_ids
+        combined_input_ids = tokenized_prompts["input_ids"][i] + tokenized_completions["input_ids"][i]
+        combined_attention_mask = tokenized_prompts["attention_mask"][i] + tokenized_completions["attention_mask"][i]
+        
+        # For labels, use -100 for prompt tokens (to ignore them in loss) and actual token ids for completion
+        labels = [-100] * len(tokenized_prompts["input_ids"][i]) + tokenized_completions["input_ids"][i]
+        
+        result["input_ids"].append(combined_input_ids)
+        result["attention_mask"].append(combined_attention_mask)
+        result["labels"].append(labels)
+    
+    return result
 
 if False:
-    # Login using e.g. `huggingface-cli login` to access this dataset
-    #ds = load_dataset("SWE-bench/SWE-bench")
-    ds = load_dataset("princeton-nlp/SWE-bench_oracle")
-
-
-    # Tokenize the dataset
-    tokenize_dataset(
-        dataset_name_or_path='./training_data',
-        output_dir="./tokenized_data",
-        tokenizer_name="llama",  # Using llama tokenizer
-        num_proc=30,
-        push_to_hub_user=None
+    # Process dataset in smaller batches to avoid OOM
+    tokenized_ds = ds.map(
+        tokenize_function,
+        batched=True,
+        batch_size=16,  # Process in small batches
+        remove_columns=["prompt", "completion"],  # Remove original text columns
+        num_proc=4,  # Use multiple processes
+        desc="Tokenizing dataset with completion-only labels",
     )
 
-    # Now tokenize the dataset
-    ds.save_to_disk('./training_data')
+    tokenized_ds.save_to_disk("./tokenized_swe_bench_bm25_40K")
+else:
+    tokenized_ds = load_from_disk("./tokenized_swe_bench_bm25_40K")
+
+def filter_by_length(examples, max_length):
+    return  [len(ids) <= max_length for ids in examples["input_ids"]]
 
 
-    # https://chatgpt.com/c/681a65f3-8a18-800e-b2b9-1fb183a4dab4
+#for max_length in [15_000, 20_000, 25_000, 30_000, 35_000, 40_000]:
+for max_length in [45_000, 50_000, 55_000, 60_000, 65_000, 70_000, 75_000, 80_000, 85_000, 90_000, 95_000, 100_000]:
+    print(f'Max length: {max_length}')
+    tokenized_short_ds = tokenized_ds.filter(filter_by_length, 
+                                fn_kwargs={"max_length":max_length},  # Pass your desired max length
+                                num_proc=4,
+                                batch_size=16,
+                                batched=True,
+                                desc=f"Filtering keeping only sequences shorter than {max_length} tokens")
 
-# Load the tokenized dataset
-tokenized_dataset = load_from_disk("./tokenized_data/training_data__tok-llama")
+    print('\tNumber of rows (train): ', tokenized_short_ds["train"].num_rows)
+    print('\tNumber of rows (validation): ', tokenized_short_ds["validation"].num_rows)
 
-print(f"After tokenized_dataset: {torch.cuda.memory_allocated() / (1024 ** 2):.2f} MB")
-print(torch.cuda.memory_summary())
+    tokenized_short_ds.save_to_disk(f"./tokenized_swe_bench_bm25_40K_short_{max_length}")
 
-df_train = tokenized_dataset["train"].to_pandas()
 
-print(f"After df_train: {torch.cuda.memory_allocated() / (1024 ** 2):.2f} MB")
-print(torch.cuda.memory_summary())
 
-# Function to determine max length for a batch
-def get_max_length_in_dataset(dataset, percentile=95):
-    lengths = [len(x["input_ids"]) for x in dataset]
-    import numpy as np
-    return int(np.percentile(lengths, percentile))
+# Add after loading dataset but before tokenizing
+def calculate_token_stats(examples, key, tokenizer):
+    # Tokenize without truncation to get actual lengths
+    tokenized = tokenizer(examples[key], truncation=False, padding=False)
+    token_lengths = [len(ids) for ids in tokenized["input_ids"]]
+    
+    return {
+        "max": max(token_lengths),
+        "median": sorted(token_lengths)[len(token_lengths) // 2],
+        "mean": sum(token_lengths) / len(token_lengths),
+        "min": min(token_lengths),
+        "total": sum(token_lengths),
+        "count": len(token_lengths)
+    }
 
-# Get a reasonable max length instead of using the longest sequence
-#max_seq_length = get_max_length_in_dataset(tokenized_dataset["train"])
-import numpy as np
-max_seq_length = int(np.percentile([x["input_ids"].shape[0] for _, x in df_train.iterrows() ], 95))
-print(f"Using max sequence length: {max_seq_length}")
-print(f"After max_seq_length: {torch.cuda.memory_allocated() / (1024 ** 2):.2f} MB")
+# Sample a subset to avoid OOM during analysis
+sample_size = min(1000, len(ds["train"]))
+sample_ds = ds["train"].select(range(sample_size))
 
-# Set up the trainer
-training_args = TrainingArguments(
+# Calculate stats for prompts and completions
+prompt_stats = calculate_token_stats(sample_ds, "prompt", tokenizer)
+completion_stats = calculate_token_stats(sample_ds, "completion", tokenizer)
+
+print(f"Prompt token statistics (sample of {sample_size}):")
+print(f"  Max: {prompt_stats['max']}")
+print(f"  Median: {prompt_stats['median']}")
+print(f"  Mean: {prompt_stats['mean']:.1f}")
+print(f"  Min: {prompt_stats['min']}")
+
+print(f"Completion token statistics (sample of {sample_size}):")
+print(f"  Max: {completion_stats['max']}")
+print(f"  Median: {completion_stats['median']}")
+print(f"  Mean: {completion_stats['mean']:.1f}")
+print(f"  Min: {completion_stats['min']}")
+
+
+mapped_ds = load_from_disk("./tokenized_swe_bench_bm25_40K", keep_in_memory=False)
+
+#max_seq_length = 40000
+
+# Fix: Use an appropriate data collator that handles padding properly
+data_collator = DataCollatorForLanguageModeling(
+    tokenizer=tokenizer,
+    mlm=False,
+    pad_to_multiple_of=8
+)
+
+# Fix: Update SFTConfig to correctly handle variable length sequences
+sft_config = SFTConfig(
     output_dir="./results",
-    num_train_epochs=1,
-    per_device_train_batch_size=5,  # Reduce batch size to save memory
-    gradient_accumulation_steps=16,  # Increase gradient accumulation to compensate
+    num_train_epochs=4,
+    per_device_train_batch_size=1,  # Reduce batch size to save memory
+    gradient_accumulation_steps=32,  # Increase gradient accumulation to compensate
     warmup_steps=100,
     weight_decay=0.01,
     logging_dir="./logs",
-    logging_steps=10,
+    logging_steps=1,
     save_strategy="epoch",
-    learning_rate=2e-4,
+    learning_rate=6e-4,
     fp16=True,
     remove_unused_columns=True,
     gradient_checkpointing=True,  # Enable gradient checkpointing
     optim="adamw_torch",  # Use memory-efficient optimizer
     max_grad_norm=0.3,    # Clip gradients to prevent spikes
-)
+    completion_only_loss=True,
+    disable_tqdm=False,
+)   
 
-# Create a data collator with memory-efficient padding
-data_collator = DataCollatorForLanguageModeling(
-    tokenizer=tokenizer, 
-    mlm=False,
-    pad_to_multiple_of=8
-)
 print(f"After data_collator: {torch.cuda.memory_allocated() / (1024 ** 2):.2f} MB")
 print(torch.cuda.memory_summary())
 
-# Define a memory-efficient collate function
-def custom_data_collator(features):
-    ## Pre-calculate max length to minimize recomputation
-    #max_length = min(
-    #    max(len(feature["input_ids"]) for feature in features),
-    #    max_seq_length
-    #)
-    max_length = 4096 #     max_seq_length
-    # Pre-allocate tensors with the right size
-    batch_size = len(features)
-    input_ids = torch.full((batch_size, max_length), tokenizer.pad_token_id, dtype=torch.long)
-    labels = torch.full((batch_size, max_length), -100, dtype=torch.long)
-    attention_mask = torch.zeros((batch_size, max_length), dtype=torch.long)
-    
-    # Fill tensors without creating intermediate tensors
-    for i, feature in enumerate(features):
-        seq_length = min(len(feature["input_ids"]), max_length)
-        # Avoid creating temporary tensors where possible
-        if isinstance(feature["input_ids"], torch.Tensor):
-            input_ids[i, :seq_length] = feature["input_ids"][:seq_length]
-            labels[i, :seq_length] = feature["labels"][:seq_length]
-        else:
-            input_ids[i, :seq_length] = torch.tensor(feature["input_ids"][:seq_length], dtype=torch.long)
-            labels[i, :seq_length] = torch.tensor(feature["labels"][:seq_length], dtype=torch.long)
-        attention_mask[i, :seq_length] = 1
-    
-    # Let the trainer handle device placement
-    return {
-        "input_ids": input_ids,
-        "labels": labels,
-        "attention_mask": attention_mask
-    }
-
-
 # Initialize the Trainer
-trainer = Trainer(
+trainer = SFTTrainer(
     model=model,
-    args=training_args,
-    train_dataset=tokenized_dataset["train"],#.select(range(2)),
-    eval_dataset=tokenized_dataset["validation"] if "validation" in tokenized_dataset else None,
-    data_collator=custom_data_collator,
+    args=sft_config,
+    train_dataset=ds["train"].select(range(5)),
+    eval_dataset=ds["validation"].select(range(5)),
+    peft_config=peft_config,
+    data_collator=data_collator,
 )
-print(f"After trainer: {torch.cuda.memory_allocated() / (1024 ** 2):.2f} MB")
+
+
+print(f"After SFTTrainer: {torch.cuda.memory_allocated() / (1024 ** 2):.2f} MB")
 print(torch.cuda.memory_summary())
 
-# Empty CUDA cache before training
+
+import gc, torch
+gc.collect()
 torch.cuda.empty_cache()
+model.config.use_cache = False
 
-print(f"After torch.cuda.empty_cache: {torch.cuda.memory_allocated() / (1024 ** 2):.2f} MB")
-print(torch.cuda.memory_summary())
 
 # Create a custom callback to periodically clear CUDA cache
 class CacheClearingCallback(TrainerCallback):
@@ -244,14 +308,14 @@ class CacheClearingCallback(TrainerCallback):
             print(f"Step {state.global_step}: Cleared CUDA cache")
 
 # Add the callback to periodically clear cache
-trainer.add_callback(CacheClearingCallback(steps_interval=50))
-torch.cuda.empty_cache()
+trainer.add_callback(CacheClearingCallback(steps_interval=10))
 
-# Train the model
+
 trainer.train()
+
 print(f"After trainer.train: {torch.cuda.memory_allocated() / (1024 ** 2):.2f} MB")
 print(torch.cuda.memory_summary())
 
 # Save the model adapter
-model.save_pretrained("./qwen3-swe-bench-lora-epoch2")
+#model.save_pretrained("./qwen3-swe-bench-bm25_40K-lora-epoch4")
 
