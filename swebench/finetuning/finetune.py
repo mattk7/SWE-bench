@@ -220,7 +220,7 @@ data_collator = DataCollatorForLanguageModeling(
 # Fix: Update SFTConfig to correctly handle variable length sequences
 sft_config = SFTConfig(
     output_dir="./results",
-    num_train_epochs=1,
+    num_train_epochs=2,
     per_device_train_batch_size=1,  # Reduce batch size to save memory
     gradient_accumulation_steps=8,  # Increase gradient accumulation to compensate
     warmup_steps=100,
@@ -236,7 +236,7 @@ sft_config = SFTConfig(
     max_grad_norm=0.3,    # Clip gradients to prevent spikes
     completion_only_loss=True,
     disable_tqdm=False,
-    evaluation_strategy="steps",
+    #evaluation_strategy="steps",
     eval_steps=20,  # How often to evaluate
     per_device_eval_batch_size=1  # Same as training for memory consistency
 )   
@@ -291,4 +291,5 @@ print(torch.cuda.memory_summary())
 
 # Save the model adapter
 #model.save_pretrained("./qwen3-swe-bench-bm25_40K-lora-epoch4")
-model.save_pretrained("./qwen3-swe-bench-bm25_40K-lora-epoch1-8B-64r-16a-44000")
+#model.save_pretrained("./qwen3-swe-bench-bm25_40K-lora-epoch1-8B-64r-16a-44000")
+model.save_pretrained("./qwen3-swe-bench-bm25_40K-lora-epoch4-8B-64r-16a-44000-no-lora-eval")
