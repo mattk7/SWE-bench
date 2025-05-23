@@ -236,6 +236,9 @@ sft_config = SFTConfig(
     max_grad_norm=0.3,    # Clip gradients to prevent spikes
     completion_only_loss=True,
     disable_tqdm=False,
+    evaluation_strategy="steps",
+    eval_steps=20,  # How often to evaluate
+    per_device_eval_batch_size=1  # Same as training for memory consistency
 )   
 
 print(f"After data_collator: {torch.cuda.memory_allocated() / (1024 ** 2):.2f} MB")
