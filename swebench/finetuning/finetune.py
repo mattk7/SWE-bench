@@ -36,7 +36,8 @@ bnb_config = BitsAndBytesConfig(
 )
 
 # Load the model
-model_name = "Qwen/Qwen3-0.6B"
+#model_name = "Qwen/Qwen3-0.6B"
+model_name = "Qwen/Qwen3-8B"
 #model_name = "llama"
 
 # Check GPU memory before loading
@@ -89,7 +90,7 @@ print(torch.cuda.memory_summary())
 
 # Configure LoRA
 peft_config = LoraConfig(
-    r=32,                   # Rank
+    r=64,                   # Rank
     lora_alpha=16,# 16,         # Alpha parameter
 #    target_modules=["q_proj", "v_proj"],
 #    target_modules=["q_proj", "v_proj"],#, "k_proj", "o_proj"],
@@ -170,78 +171,42 @@ def tokenize_function(examples):
     return result
 
 if False:
-    # Process dataset in smaller batches to avoid OOM
-    tokenized_ds = ds.map(
-        tokenize_function,
-        batched=True,
-        batch_size=16,  # Process in small batches
-        remove_columns=["prompt", "completion"],  # Remove original text columns
-        num_proc=4,  # Use multiple processes
-        desc="Tokenizing dataset with completion-only labels",
-    )
+    if False:
+        # Process dataset in smaller batches to avoid OOM
+        tokenized_ds = ds.map(
+            tokenize_function,
+            batched=True,
+            batch_size=16,  # Process in small batches
+            remove_columns=["prompt", "completion"],  # Remove original text columns
+            num_proc=4,  # Use multiple processes
+            desc="Tokenizing dataset with completion-only labels",
+        )
 
-    tokenized_ds.save_to_disk("./tokenized_swe_bench_bm25_40K")
+        tokenized_ds.save_to_disk("./tokenized_swe_bench_bm25_40K")
+    else:
+        tokenized_ds = load_from_disk("./tokenized_swe_bench_bm25_40K")
+
+    def filter_by_length(examples, max_length):
+        return  [len(ids) <= max_length for ids in examples["input_ids"]]
+
+    tokenized_short_ds = tokenized_ds
+    for max_length in [15_000, 20_000, 25_000, 30_000, 35_000, 40_000, 41_000, 42_000, 43_000, 44_000, 45_000, 50_000][::-1]:
+    #for max_length in [42_500]:
+        print(f'-------- Max length: {max_length} --------')
+        tokenized_short_ds = tokenized_short_ds.filter(filter_by_length, 
+                                    fn_kwargs={"max_length":max_length},  # Pass your desired max length
+                                    num_proc=4,
+                                    batch_size=16,
+                                    batched=True,
+                                    desc=f"Filtering keeping only sequences shorter than {max_length} tokens")
+
+        print('\tNumber of rows (train): ', tokenized_short_ds["train"].num_rows)
+        print('\tNumber of rows (validation): ', tokenized_short_ds["validation"].num_rows)
+
+        tokenized_short_ds.save_to_disk(f"./tokenized_swe_bench_bm25_40K_short_{max_length}")
 else:
-    tokenized_ds = load_from_disk("./tokenized_swe_bench_bm25_40K")
-
-def filter_by_length(examples, max_length):
-    return  [len(ids) <= max_length for ids in examples["input_ids"]]
-
-
-#for max_length in [15_000, 20_000, 25_000, 30_000, 35_000, 40_000]:
-for max_length in [45_000, 50_000, 55_000, 60_000, 65_000, 70_000, 75_000, 80_000, 85_000, 90_000, 95_000, 100_000]:
-    print(f'Max length: {max_length}')
-    tokenized_short_ds = tokenized_ds.filter(filter_by_length, 
-                                fn_kwargs={"max_length":max_length},  # Pass your desired max length
-                                num_proc=4,
-                                batch_size=16,
-                                batched=True,
-                                desc=f"Filtering keeping only sequences shorter than {max_length} tokens")
-
-    print('\tNumber of rows (train): ', tokenized_short_ds["train"].num_rows)
-    print('\tNumber of rows (validation): ', tokenized_short_ds["validation"].num_rows)
-
-    tokenized_short_ds.save_to_disk(f"./tokenized_swe_bench_bm25_40K_short_{max_length}")
-
-
-
-# Add after loading dataset but before tokenizing
-def calculate_token_stats(examples, key, tokenizer):
-    # Tokenize without truncation to get actual lengths
-    tokenized = tokenizer(examples[key], truncation=False, padding=False)
-    token_lengths = [len(ids) for ids in tokenized["input_ids"]]
-    
-    return {
-        "max": max(token_lengths),
-        "median": sorted(token_lengths)[len(token_lengths) // 2],
-        "mean": sum(token_lengths) / len(token_lengths),
-        "min": min(token_lengths),
-        "total": sum(token_lengths),
-        "count": len(token_lengths)
-    }
-
-# Sample a subset to avoid OOM during analysis
-sample_size = min(1000, len(ds["train"]))
-sample_ds = ds["train"].select(range(sample_size))
-
-# Calculate stats for prompts and completions
-prompt_stats = calculate_token_stats(sample_ds, "prompt", tokenizer)
-completion_stats = calculate_token_stats(sample_ds, "completion", tokenizer)
-
-print(f"Prompt token statistics (sample of {sample_size}):")
-print(f"  Max: {prompt_stats['max']}")
-print(f"  Median: {prompt_stats['median']}")
-print(f"  Mean: {prompt_stats['mean']:.1f}")
-print(f"  Min: {prompt_stats['min']}")
-
-print(f"Completion token statistics (sample of {sample_size}):")
-print(f"  Max: {completion_stats['max']}")
-print(f"  Median: {completion_stats['median']}")
-print(f"  Mean: {completion_stats['mean']:.1f}")
-print(f"  Min: {completion_stats['min']}")
-
-
-mapped_ds = load_from_disk("./tokenized_swe_bench_bm25_40K", keep_in_memory=False)
+    max_length = 44_000
+    mapped_ds = load_from_disk(f"./tokenized_swe_bench_bm25_40K_short_{max_length}", keep_in_memory=False)
 
 #max_seq_length = 40000
 
@@ -255,13 +220,13 @@ data_collator = DataCollatorForLanguageModeling(
 # Fix: Update SFTConfig to correctly handle variable length sequences
 sft_config = SFTConfig(
     output_dir="./results",
-    num_train_epochs=4,
+    num_train_epochs=1,
     per_device_train_batch_size=1,  # Reduce batch size to save memory
-    gradient_accumulation_steps=32,  # Increase gradient accumulation to compensate
+    gradient_accumulation_steps=8,  # Increase gradient accumulation to compensate
     warmup_steps=100,
     weight_decay=0.01,
     logging_dir="./logs",
-    logging_steps=1,
+    logging_steps=5,
     save_strategy="epoch",
     learning_rate=6e-4,
     fp16=True,
@@ -280,10 +245,12 @@ print(torch.cuda.memory_summary())
 trainer = SFTTrainer(
     model=model,
     args=sft_config,
-    train_dataset=ds["train"].select(range(5)),
-    eval_dataset=ds["validation"].select(range(5)),
     peft_config=peft_config,
-    data_collator=data_collator,
+#    train_dataset=ds["train"].select(range(5)),
+#    eval_dataset=ds["validation"].select(range(5)),
+#    data_collator=data_collator,
+    train_dataset=mapped_ds["train"],
+    eval_dataset=mapped_ds["validation"],
 )
 
 
@@ -308,8 +275,11 @@ class CacheClearingCallback(TrainerCallback):
             print(f"Step {state.global_step}: Cleared CUDA cache")
 
 # Add the callback to periodically clear cache
-trainer.add_callback(CacheClearingCallback(steps_interval=10))
+trainer.add_callback(CacheClearingCallback(steps_interval=5))
 
+
+print(f"After SFTTrainer: {torch.cuda.memory_allocated() / (1024 ** 2):.2f} MB")
+print(torch.cuda.memory_summary())
 
 trainer.train()
 
@@ -318,4 +288,4 @@ print(torch.cuda.memory_summary())
 
 # Save the model adapter
 #model.save_pretrained("./qwen3-swe-bench-bm25_40K-lora-epoch4")
-
+model.save_pretrained("./qwen3-swe-bench-bm25_40K-lora-epoch1-8B-64r-16a-44000")
