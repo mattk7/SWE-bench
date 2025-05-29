@@ -32,12 +32,14 @@ bnb_config = BitsAndBytesConfig(
     load_in_8bit=True,
     bnb_8bit_use_double_quant=True,
     bnb_8bit_quant_type="nf8",
-    bnb_8bit_compute_dtype=torch.float16,    
+    bnb_8bit_compute_dtype=torch.bfloat16,    
 )
 
 # Load the model
 #model_name = "Qwen/Qwen3-0.6B"
-model_name = "Qwen/Qwen3-8B"
+#model_name = "Qwen/Qwen3-8B"
+#model_name = "Qwen/Qwen3-1.7B"
+model_name = "Qwen/Qwen3-4B"
 #model_name = "llama"
 
 # Check GPU memory before loading
@@ -63,7 +65,7 @@ print(torch.cuda.memory_summary())
 # Load base model with 4-bit quantization for memory efficiency
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
-    torch_dtype=torch.float16,  # Explicitly set to float16
+    torch_dtype=torch.bfloat16,  # Explicitly set to float16
     device_map="auto",
     quantization_config=bnb_config,
     trust_remote_code=True,
@@ -122,12 +124,13 @@ from swebench.inference.make_datasets.tokenize_dataset import main as tokenize_d
 from trl import SFTConfig, SFTTrainer
 from transformers import TrainingArguments
 
-# Login using e.g. `huggingface-cli login` to access this dataset
-ds = load_dataset("princeton-nlp/SWE-bench_bm25_40K")
-#ds = load_dataset("princeton-nlp/SWE-bench_bm25_13K")
-ds = ds.rename_column("text", "prompt")
-ds = ds.rename_column("patch", "completion")
-ds = ds.remove_columns([col for col in ds['train'].column_names if col not in ["prompt", "completion"]])
+if False:
+    # Login using e.g. `huggingface-cli login` to access this dataset
+    ds = load_dataset("princeton-nlp/SWE-bench_bm25_40K")
+    #ds = load_dataset("princeton-nlp/SWE-bench_bm25_13K")
+    ds = ds.rename_column("text", "prompt")
+    ds = ds.rename_column("patch", "completion")
+    ds = ds.remove_columns([col for col in ds['train'].column_names if col not in ["prompt", "completion"]])
 
 
 def tokenize_function(examples):
@@ -158,12 +161,14 @@ def tokenize_function(examples):
     
     for i in range(len(tokenized_prompts["input_ids"])):
         # Combine prompt and completion input_ids
-        combined_input_ids = tokenized_prompts["input_ids"][i] + tokenized_completions["input_ids"][i]
-        combined_attention_mask = tokenized_prompts["attention_mask"][i] + tokenized_completions["attention_mask"][i]
+        combined_input_ids = tokenized_prompts["input_ids"][i] + tokenized_completions["input_ids"][i][:-1]
+        combined_attention_mask = tokenized_prompts["attention_mask"][i] + tokenized_completions["attention_mask"][i][:-1]
         
         # For labels, use -100 for prompt tokens (to ignore them in loss) and actual token ids for completion
-        labels = [-100] * len(tokenized_prompts["input_ids"][i]) + tokenized_completions["input_ids"][i]
+        labels = [-100] * (len(tokenized_prompts["input_ids"][i])-1) + tokenized_completions["input_ids"][i]
         
+        assert len(combined_input_ids) == len(combined_attention_mask) == len(labels)
+
         result["input_ids"].append(combined_input_ids)
         result["attention_mask"].append(combined_attention_mask)
         result["labels"].append(labels)
@@ -178,13 +183,13 @@ if False:
             batched=True,
             batch_size=16,  # Process in small batches
             remove_columns=["prompt", "completion"],  # Remove original text columns
-            num_proc=4,  # Use multiple processes
+            num_proc=6,  # Use multiple processes
             desc="Tokenizing dataset with completion-only labels",
         )
 
-        tokenized_ds.save_to_disk("./tokenized_swe_bench_bm25_40K")
+        tokenized_ds.save_to_disk("./qwen3-4b_tokenized_swe_bench_bm25_40K")
     else:
-        tokenized_ds = load_from_disk("./tokenized_swe_bench_bm25_40K")
+        tokenized_ds = load_from_disk("./qwen3-4b_tokenized_swe_bench_bm25_40K")
 
     def filter_by_length(examples, max_length):
         return  [len(ids) <= max_length for ids in examples["input_ids"]]
@@ -203,10 +208,11 @@ if False:
         print('\tNumber of rows (train): ', tokenized_short_ds["train"].num_rows)
         print('\tNumber of rows (validation): ', tokenized_short_ds["validation"].num_rows)
 
-        tokenized_short_ds.save_to_disk(f"./tokenized_swe_bench_bm25_40K_short_{max_length}")
+        tokenized_short_ds.save_to_disk(f"./qwen3-4b_tokenized_swe_bench_bm25_40K_short_{max_length}")
 else:
     max_length = 44_000
-    mapped_ds = load_from_disk(f"./tokenized_swe_bench_bm25_40K_short_{max_length}", keep_in_memory=False)
+    #mapped_ds = load_from_disk(f"./qwen4b_tokenized_swe_bench_bm25_40K_short_{max_length}", keep_in_memory=False)
+    mapped_ds = load_from_disk(f"./qwen3-4b_tokenized_swe_bench_bm25_40K", keep_in_memory=False)
 
 #max_seq_length = 40000
 
@@ -220,13 +226,13 @@ data_collator = DataCollatorForLanguageModeling(
 # Fix: Update SFTConfig to correctly handle variable length sequences
 sft_config = SFTConfig(
     output_dir="./results",
-    num_train_epochs=2,
-    per_device_train_batch_size=1,  # Reduce batch size to save memory
-    gradient_accumulation_steps=8,  # Increase gradient accumulation to compensate
+    num_train_epochs=1,
+    per_device_train_batch_size=4,  # Reduce batch size to save memory
+    gradient_accumulation_steps=2,  # Increase gradient accumulation to compensate
     warmup_steps=100,
     weight_decay=0.01,
     logging_dir="./logs",
-    logging_steps=5,
+    logging_steps=10,
     save_strategy="epoch",
     learning_rate=6e-4,
     fp16=True,
@@ -278,7 +284,7 @@ class CacheClearingCallback(TrainerCallback):
             print(f"Step {state.global_step}: Cleared CUDA cache")
 
 # Add the callback to periodically clear cache
-trainer.add_callback(CacheClearingCallback(steps_interval=5))
+trainer.add_callback(CacheClearingCallback(steps_interval=4))
 
 
 print(f"After SFTTrainer: {torch.cuda.memory_allocated() / (1024 ** 2):.2f} MB")
@@ -292,4 +298,6 @@ print(torch.cuda.memory_summary())
 # Save the model adapter
 #model.save_pretrained("./qwen3-swe-bench-bm25_40K-lora-epoch4")
 #model.save_pretrained("./qwen3-swe-bench-bm25_40K-lora-epoch1-8B-64r-16a-44000")
-model.save_pretrained("./qwen3-swe-bench-bm25_40K-lora-epoch4-8B-64r-16a-44000-no-lora-eval")
+#model.save_pretrained("./qwen3-swe-bench-bm25_40K-lora-epoch4-8B-64r-16a-44000-no-lora-eval")
+#model.save_pretrained("./qwen3-swe-bench-bm25_40K-lora-epoch4-4B-64r-16a-44000-bfloat16")
+model.save_pretrained("./qwen3-swe-bench-bm25_40K-lora-epoch1-4B-64r-16a-bfloat16")
